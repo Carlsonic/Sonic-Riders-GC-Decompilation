@@ -8,16 +8,16 @@ This index helps reproduce matching C without disclosing source code. It gives t
 | lbl_000C3498 | 000C3498 | 000C3514 | 26 | — | — |
 | lbl_000C5848 | 000C5848 | 000C5EE0 | 92 | — | — |
 | lbl_000C7C54 | 000C7C54 | 000C7D30 | 55 | — | — |
-| lbl_000CE0A4 | 000CE0A4 | 000CE120 | 31 | — | — |
-| lbl_000F7EB8 | 000F7EB8 | 000F7EF0 | 14 | 000F7EF0 | Reads interface status byte from pointer pool (idx*8+0x6004; if idx<0 uses +0x6198). |
+| lbl_000CE0A4 | 000CE0A4 | 000CE120 | 31 | — | Panel/state helper; often matches with minimal C. |
+| lbl_000F7EB8 | 000F7EB8 | 000F7EF0 | 14 | 000F7EF0 | Interface status byte accessor: reads via pointer pool at idx*8+0x6004; if idx<0 uses +0x6198. |
 | lbl_0010F380 | 0010F380 | 0010F3BC | 15 | — | — |
-| lbl_001678B8 | 001678B8 | 001678DC | 9 | — | — |
+| lbl_001678B8 | 001678B8 | 001678DC | 9 | — | Tiny leaf; good first target to learn levers. |
 | lbl_000ADA28 | 000ADA28 | 000ADAB0 | 10 | — | — |
 | lbl_000ADB18 | 000ADB18 | 000ADB4C | 9 | — | — |
 | lbl_000B034C | 000B034C | 000B03D4 | 22 | — | — |
 | lbl_001228E0 | 001228E0 | 0012292C | 19 | — | — |
 | lbl_0017D56C | 0017D56C | 0017D5E0 | 21 | — | — |
-| lbl_000B09D4 | 000B09D4 | 000B0A00 | 11 | — | — |
+| lbl_000B09D4 | 000B09D4 | 000B0A00 | 11 | — | Small leaf. |
 | lbl_001216C0 | 001216C0 | 00121704 | 17 | — | — |
 | lbl_00045228 | 00045228 | 0004525C | 13 | — | — |
 | lbl_00045260 | 00045260 | 00045280 | 8 | — | — |
@@ -42,13 +42,17 @@ This index helps reproduce matching C without disclosing source code. It gives t
 | lbl_0011F630 | 0011F630 | 0011F64C | 7 | — | — |
 | lbl_0019E028 | 0019E028 | 0019E050 | 10 | — | — |
 | lbl_000B0670 | 000B0670 | 000B06E0 | 28 | — | — |
-| lbl_0017B66C | 0017B66C | 0017B6AC | 16 | — | — |
+| lbl_0017B66C | 0017B66C | 0017B6AC | 16 | TBD | Check boundary: map may point to internal label/epilogue. Verify true end (stwu->blr before next stwu). |
 | lbl_0018C1C4 | 0018C1C4 | 0018C234 | 31 | — | — |
 | lbl_0018DA80 | 0018DA80 | 0018DAB8 | 14 | — | — |
 | lbl_00163624 | 00163624 | 00163670 | 19 | — | — |
-| lbl_000F94B0 | 000F94B0 | 000F94BC | 13 | TBD | — |
+| lbl_000F94B0 | 000F94B0 | 000F94BC | 13 | TBD | Boundary trap: map span likely wrong (internal label/epilogue). Find true end marker. |
 | lbl_001A952C | 001A952C | 001A9574 | 10 | — | — |
 | lbl_001B623C | 001B623C | 001B626C | 10 | — | — |
 | lbl_000F0EA4 | 000F0EA4 | 000F0ED8 | 13 | — | — |
 | lbl_000B766C | 000B766C | 000B76DC | 28 | — | — |
 | lbl_DumpPackManFile | — | — | — | — | Standalone pack utility |
+
+| lbl_00194D18 | 00194D18 | 00194E54 | 79 | 00194E54 | Shop/Exchange/Exit option callback: reads interface index at +0x4E, state at +0x0C; writes record fields. |
+| lbl_000F9300 | 000F9300 | 000F94B0 | 108 | TBD | Blocked (prop tension + REL24 ceiling). End marker likely needed; try small structural tweaks. |
+| lbl_000A121C | 000A121C | 000A1240 | 9 | 000A1240 | Small helper; if-conversion can produce identical returns — boundary/end marker helps. |
