@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Compile and compare one _Main candidate using its linker-map span."""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+MAP_PATH = ROOT / "_Main.map"
+ASM_PATH = ROOT / "asm/_Main/text.s"
+MAKEFILE_PATH = ROOT / "Makefile"
+STATUS_PATH = ROOT / "status.json"
+MAX_ATTEMPTS = 12
+MAP_ENTRY = re.compile(
+    r"^\s*([0-9A-Fa-f]{8})\s+([0-9A-Fa-f]{6})\s+"
+    r"[0-9A-Fa-f]{8}\s+([A-Za-z_][A-Za-z0-9_]*) \(entry of \.text\)"
+)
+ASM_WORD = re.compile(r"^/\* [0-9A-Fa-f]+ ([0-9A-Fa-f]{8}) \*/\s*(.*)$")
+# _Main listings put the linked address first: /* 000B76DC 2C030004 */.
+ASM_ADDR = re.compile(r"^/\* ([0-9A-Fa-f]{8}) [0-9A-Fa-f]{8} \*/")
+PER_OBJECT = re.compile(r"^([^\s:#]+\.o):\s*CFLAGS\s*\+=\s*(.+)$")
+
+
+def per_object_flags(candidate: Path) -> str:
+    """Extra MWCC flags the Makefile records for this candidate's object.
+
+    The real build applies `src/foo.o: CFLAGS += ...` lines, and `--integrate`
+    deliberately refuses a separate `--flags`, so the comparison has to apply
+    them too -- otherwise a function whose original was built with e.g.
+    `-use_lmw_stmw on` scores a false failure and can never be integrated.
+    `--flags` still overrides this for an experiment not yet recorded.
+    """
+    obj = os.path.normpath(str(candidate.with_suffix(".o")))
+    for line in MAKEFILE_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = PER_OBJECT.match(line)
+        if match and os.path.normpath(match.group(1)) == obj:
+            return match.group(2).strip()
+    return ""
+
+
+def parse_map():
+    entries = []
+    with MAP_PATH.open(encoding="utf-8", errors="replace") as map_file:
+        for line in map_file:
+            match = MAP_ENTRY.match(line)
+            if match:
+                entries.append(
+                    (int(match.group(1), 16), int(match.group(2), 16), match.group(3))
+                )
+    return sorted(entries)
+
+
+def find_symbol_span(symbol):
+    entries = parse_map()
+    matches = [index for index, entry in enumerate(entries) if entry[2] == symbol]
+    if len(matches) != 1:
+        raise ValueError(f"expected one _Main.map entry for {symbol}, found {len(matches)}")
+    index = matches[0]
+    address, declared_size, _ = entries[index]
+    following = next((entry for entry in entries[index + 1 :] if entry[0] > address), None)
+    if following is None:
+        raise ValueError(f"no following .text symbol in _Main.map for {symbol}")
+    next_address, _, _ = following
+
+    # The current linker map emits a zero size for every .text symbol. Use the
+    # next mapped symbol only as a conservative span, then validate the listing.
+    span = declared_size or (next_address - address)
+    boundary = address + span
+    end_entries = [entry for entry in entries if entry[0] == boundary]
+    next_symbol = end_entries[0][2] if end_entries else None
+    if span % 4:
+        raise ValueError(f"mapped span for {symbol} is not instruction-aligned: 0x{span:X}")
+    return span, next_symbol, declared_size
+
+
+def target_asm_words(symbol, count, end_marker=None):
+    """Instruction words of `symbol`, bounded either by the map span or by an
+    explicit end marker.
+
+    The map span is only a conservative upper bound: `_Main.map` contains every
+    internal branch label, so a span frequently stops in the middle of a
+    function at a `b` that merely jumps to a shared epilogue. An end marker
+    (an assembly label or a comment address) is authoritative instead, and
+    overrides the map-derived count.
+    """
+    lines = ASM_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    start = f"{symbol}:"
+    try:
+        index = lines.index(start) + 1
+    except ValueError as exc:
+        raise ValueError(f"assembly label {start} not found in {ASM_PATH}") from exc
+
+    stop_label = None
+    stop_addr = None
+    if end_marker is not None:
+        if re.fullmatch(r"[0-9A-Fa-f]{8}", end_marker):
+            stop_addr = end_marker.upper()
+        else:
+            stop_label = f"{end_marker}:"
+            if stop_label not in lines:
+                raise ValueError(
+                    f"assembly label {stop_label} not found in {ASM_PATH}"
+                )
+    bounded = stop_label is not None or stop_addr is not None
+
+    selected = []
+    reached_marker = not bounded
+    while index < len(lines):
+        line = lines[index]
+        if stop_label is not None and line == stop_label:
+            reached_marker = True
+            break
+        match = ASM_WORD.match(line)
+        if match:
+            if stop_addr is not None and ASM_ADDR.match(line).group(1).upper() == stop_addr:
+                reached_marker = True
+                break
+            selected.append((line, match.group(2).strip()))
+            if not bounded and len(selected) >= count:
+                break
+        index += 1
+
+    if bounded:
+        if not reached_marker:
+            raise ValueError(
+                f"end marker {end_marker} was never reached after {symbol}"
+            )
+        if not selected:
+            raise ValueError(
+                f"end marker {end_marker} collected no instructions after {symbol}"
+            )
+    elif len(selected) != count:
+        raise ValueError(
+            f"listing boundary after {symbol} contains {len(selected)} instructions; "
+            f"map span requires {count}"
+        )
+
+    final_instruction = selected[-1][1]
+    if not (
+        final_instruction == "blr"
+        or re.match(r"^(?:b|ba)\s+\S", final_instruction)
+    ):
+        raise ValueError(
+            f"boundary for {symbol} ends in {final_instruction or '<unknown>'}, not blr or "
+            "an unconditional b; refusing an ambiguous boundary"
+        )
+    return [line for line, _ in selected]
+
+
+def parse_comparison(output):
+    target_count = re.search(r"target instructions:\s*(\d+)", output)
+    candidate_count = re.search(r"candidate instructions:\s*(\d+)", output)
+    identical = re.search(r"identical overall:\s*(\d+)\s*/\s*\d+", output)
+    divergence = re.search(r"first divergence at instruction:\s*(\d+)", output)
+    if not (target_count and candidate_count and identical and divergence):
+        raise ValueError("comparator output did not contain a complete result")
+
+    target_count = int(target_count.group(1))
+    candidate_count = int(candidate_count.group(1))
+    identical = int(identical.group(1))
+    divergence_instruction = int(divergence.group(1))
+    relocation_ok = (
+        "relocations: none on either side" in output
+        or "symbol reference(s) match in order:" in output
+    )
+    exact = target_count == candidate_count == identical and relocation_ok
+    offset = 4 * (divergence_instruction - 1)
+    return target_count, candidate_count, identical, offset, relocation_ok, exact
+
+
+def integrated_symbols():
+    text = MAKEFILE_PATH.read_text(encoding="utf-8")
+    if "MAIN_FUNCS :=" not in text:
+        return set()
+    block = text.split("MAIN_FUNCS :=", 1)[1].split("MAIN_INCS :=", 1)[0]
+    return set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*):", block, re.MULTILINE))
+
+
+def load_status():
+    if not STATUS_PATH.is_file():
+        return {"version": 1, "functions": {}}
+    try:
+        data = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{STATUS_PATH.name} is not valid JSON: {exc}") from exc
+    data.setdefault("version", 1)
+    data.setdefault("functions", {})
+    return data
+
+
+def save_status(status):
+    STATUS_PATH.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def record_status(symbol, state, identical, total, variant=""):
+    status = load_status()
+    entry = status["functions"].setdefault(symbol, {"attempts": 0, "state": "untried"})
+    entry["attempts"] += 1
+    entry["state"] = state
+    if total:
+        entry["best"] = f"{identical}/{total}"
+    if variant:
+        entry.setdefault("tried", []).append(
+            {"attempt": entry["attempts"], "variant": variant, "result": f"{identical}/{total}"}
+        )
+    status["updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    save_status(status)
+    return entry
+
+
+def makefile_entry_exists(symbol):
+    text = MAKEFILE_PATH.read_text(encoding="utf-8")
+    block = text.split("MAIN_FUNCS :=", 1)[1].split("MAIN_INCS :=", 1)[0]
+    return re.search(rf"^\s*{re.escape(symbol)}:", block, re.MULTILINE) is not None
+
+
+def integrate_candidate(symbol, next_symbol, c_file):
+    if next_symbol is None:
+        raise ValueError("no mapped end symbol was found")
+    listing = ASM_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    # splice_main_text.sh matches either "LABEL:" or an instruction line whose
+    # comment starts with the address. The address form is the only boundary
+    # available after a function whose successor carries no label, which is why
+    # it is accepted here rather than requiring a label in every case.
+    if re.fullmatch(r"[0-9A-Fa-f]{8}", next_symbol):
+        if not any(line.startswith(f"/* {next_symbol} ") for line in listing):
+            raise ValueError(
+                f"{next_symbol} is not an instruction address in the listing; automatic "
+                "integration requires a label or an instruction address"
+            )
+    elif f"{next_symbol}:" not in listing:
+        raise ValueError(
+            f"next map symbol {next_symbol} is not an assembly label; automatic integration "
+            "requires a label end marker"
+        )
+    if makefile_entry_exists(symbol):
+        raise ValueError(f"{symbol} is already present in MAIN_FUNCS")
+
+    try:
+        relative_source = c_file.resolve().relative_to(ROOT)
+    except ValueError as exc:
+        raise ValueError("only a candidate source inside the Sonic Riders repository can be integrated") from exc
+    if relative_source.suffix != ".c" or not relative_source.is_file():
+        raise ValueError("integration source must be an existing .c file")
+    source = relative_source.with_suffix("").as_posix()
+    entry = f"\t{symbol}:{next_symbol}:{source}"
+
+    text = MAKEFILE_PATH.read_text(encoding="utf-8")
+    incs = re.search(r"^MAIN_INCS\s*:=", text, re.MULTILINE)
+    if not incs:
+        raise ValueError("could not locate MAIN_INCS in Makefile")
+    # MAIN_FUNCS rows run right up to the MAIN_INCS line, with no blank line
+    # between them, so split on the rule itself rather than on "\n\n".
+    head = text[: incs.start()].rstrip("\n")
+    sep = ""
+    tail = text[incs.start() :]
+    lines = head.rstrip("\n").split("\n")
+    last_index = next(
+        (i for i in range(len(lines) - 1, -1, -1)
+         if lines[i].startswith("\t") and ":" in lines[i]),
+        None,
+    )
+    if last_index is None:
+        raise ValueError("could not locate the last MAIN_FUNCS row in Makefile")
+    last = lines[last_index]
+    # Invariant: every row except the last ends with a continuation backslash.
+    # The appended row becomes the new last row, so it must not carry one.
+    if last.endswith("\\"):
+        lines[last_index] = last.rstrip()
+    else:
+        lines[last_index] = last + " \\"
+    lines.append(entry)
+    MAKEFILE_PATH.write_text("\n".join(lines) + "\n" + sep + tail, encoding="utf-8")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compile and compare one candidate against its _Main.map span."
+    )
+    parser.add_argument("symbol", help="local assembly symbol, e.g. lbl_00163624")
+    parser.add_argument("candidate", type=Path, help="candidate C source file")
+    parser.add_argument(
+        "--flags",
+        default="",
+        help="additional MWCC flags, passed through to compare_function.py",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print the full comparator report after the summary",
+    )
+    parser.add_argument(
+        "--end-marker",
+        default=None,
+        help="authoritative listing boundary: an assembly label or an 8-digit "
+             "comment address. Overrides the map-derived span, which frequently "
+             "stops early at an internal branch label.",
+    )
+    parser.add_argument(
+        "--integrate",
+        action="store_true",
+        help="add an exact candidate to MAIN_FUNCS (requires an assembly-label "
+             "end marker, or an instruction address when the successor is unlabelled)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="run even when the recorded attempt limit is reached",
+    )
+    parser.add_argument(
+        "--note",
+        default="",
+        help="short description of this hypothesis, recorded in status.json",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="print this symbol's recorded status and exit",
+    )
+    args = parser.parse_args()
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.symbol):
+        parser.error("symbol must be an assembly identifier")
+
+    if args.status:
+        status = load_status()
+        entry = status["functions"].get(args.symbol)
+        if not entry:
+            print(f"{args.symbol}: untried")
+        else:
+            print(
+                f"{args.symbol}: {entry.get('state')} "
+                f"(attempts {entry.get('attempts', 0)}, best {entry.get('best', 'n/a')})"
+                + (f" - {entry['note']}" if entry.get("note") else "")
+            )
+        return 0
+
+    log_path = ROOT / ".build/try" / f"{args.symbol}.log"
+    try:
+        known = load_status()["functions"].get(args.symbol, {})
+        if (known.get("state") == "matched" and args.symbol not in integrated_symbols()
+                and not args.integrate):
+            print(
+                f"{args.symbol} is already marked matched; "
+                "clear its status entry before re-verifying it"
+            )
+            return 1
+        if known.get("attempts", 0) >= MAX_ATTEMPTS and known.get("state") != "matched" \
+                and not args.force:
+            print(
+                f"{args.symbol} has used {known['attempts']} attempts (limit {MAX_ATTEMPTS}) and is "
+                f"marked {known.get('state')}; record the blocker and move on "
+                "(use --force to override)"
+            )
+            return 1
+        span, next_symbol, declared_size = find_symbol_span(args.symbol)
+        expected_count = span // 4
+        words = target_asm_words(args.symbol, expected_count, args.end_marker)
+        # An explicit end marker is authoritative: the map-derived successor is
+        # usually an internal branch label, not the true function end. An address
+        # marker overrides it for integration as well, so the recorded boundary
+        # is the real function end instead of the map's successor.
+        if args.end_marker and (args.integrate
+                                or not re.fullmatch(r"[0-9A-Fa-f]{8}", args.end_marker)):
+            next_symbol = args.end_marker
+        if args.integrate and args.flags:
+            raise ValueError("--integrate cannot be combined with extra flags; add required flags to Makefile")
+        # Explicit --flags wins; otherwise apply whatever the Makefile records for
+        # this object, so a measurement matches the build that will be hashed.
+        extra_flags = args.flags or per_object_flags(args.candidate)
+
+        with tempfile.TemporaryDirectory(prefix="um-try-") as temp_dir:
+            temp_dir_path = Path(temp_dir)
+            bounded_asm = temp_dir_path / "bounded.s"
+            bounded_asm.write_text(
+                f"{args.symbol}:\n" + "\n".join(words) + f"\n{args.symbol}_end:\n",
+                encoding="utf-8",
+            )
+            command = [
+                sys.executable,
+                str(ROOT / "tools/compare_function.py"),
+                str(args.candidate.resolve()),
+                os.path.relpath(bounded_asm, ROOT),
+                args.symbol,
+                f"{args.symbol}_end",
+            ]
+            if extra_flags:
+                command.append(extra_flags)
+            result = subprocess.run(
+                command, cwd=ROOT, capture_output=True, text=True, check=False
+            )
+            output = result.stdout + result.stderr
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(output, encoding="utf-8")
+            if result.returncode != 0:
+                print(f"COMPILE/COMPARE FAIL; see {log_path.relative_to(ROOT)}")
+                if args.verbose:
+                    print(output, end="")
+                return result.returncode or 1
+
+        target_count, candidate_count, identical, offset, reloc_ok, exact = parse_comparison(output)
+        if exact:
+            summary = f"{identical}/{target_count} words, exact, relocation OK"
+        else:
+            offset_text = f"@+0x{offset:02X}"
+            summary = (
+                f"{identical}/{target_count} words, first divergence {offset_text}, "
+                f"relocation {'OK' if reloc_ok else 'FAIL'}"
+            )
+            if candidate_count != target_count:
+                summary += f", candidate has {candidate_count} words"
+        if declared_size == 0:
+            summary += f" (map span +0x{span:X} to {next_symbol})"
+        print(summary)
+        if args.verbose:
+            print(output, end="")
+
+        state = "matched" if exact else "in-progress"
+        entry = record_status(args.symbol, state, identical, target_count, args.note)
+        print(
+            f"status: {state}, attempt {entry['attempts']}/{MAX_ATTEMPTS} "
+            f"(recorded in {STATUS_PATH.name})"
+        )
+
+        if args.integrate:
+            if not exact:
+                print("not added to MAIN_FUNCS: candidate is not an exact instruction and relocation match")
+                return 1
+            integrate_candidate(args.symbol, next_symbol, args.candidate.resolve())
+            print(f"added {args.symbol} to MAIN_FUNCS; run the full checksum build before considering it verified")
+        return 0 if exact else 1
+    except (OSError, ValueError) as exc:
+        print(f"try: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

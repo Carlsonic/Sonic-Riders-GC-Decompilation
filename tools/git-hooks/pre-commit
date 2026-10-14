@@ -1,0 +1,40 @@
+#!/bin/sh
+# Pre-commit gate: a matching-decomp commit must not break the DOL/REL checksums.
+#
+# Installed with tools/install_hooks.sh. The tracked copy lives here so it can be
+# shared; .git/hooks is not part of the repository.
+#
+# Set SKIP_SHA1=1 for a commit that genuinely cannot be built (for example a
+# documentation-only change on a machine without devkitPro), and say so in the
+# commit message.
+set -eu
+
+repo=$(git rev-parse --show-toplevel)
+cd "$repo"
+
+if [ "${SKIP_SHA1:-0}" = "1" ]; then
+    echo "pre-commit: SKIP_SHA1=1, checksums not verified"
+    exit 0
+fi
+
+# A commit that touches none of the build inputs cannot break the hashes.
+changed=$(git diff --cached --name-only | grep -E '^(Makefile|src/|asm/|tools/)' || true)
+if [ -z "$changed" ]; then
+    echo "pre-commit: no build inputs changed, skipping the checksum build"
+    exit 0
+fi
+
+if [ -z "${DEVKITPRO:-}" ] && [ ! -d /opt/devkitpro ]; then
+    echo "pre-commit: devkitPro not found and DEVKITPRO is unset." >&2
+    echo "            set DEVKITPRO, or commit with SKIP_SHA1=1 and note why." >&2
+    exit 1
+fi
+
+: "${DEVKITPRO:=/opt/devkitpro}"
+: "${DEVKITPPC:=$DEVKITPRO/devkitPPC}"
+: "${WINE:=${WINE:-wine}}"
+export DEVKITPRO DEVKITPPC WINE
+export PATH="$DEVKITPPC/bin:$DEVKITPRO/tools/bin:$PATH"
+
+echo "pre-commit: running the matching build (this takes a couple of minutes)"
+make -B SHA1SUM='shasum -a 1' all
